@@ -161,12 +161,3 @@ The display shows:
 * [M1z23R](https://github.com/M1z23R) --> MODIFIED VERSION OF HIS SCRIPT
 * [Spacehuhn Technologies](https://github.com/SpacehuhnTech) --> TEMPLATE
 
-## WARNING
-
-Use it only against your own networks and devices!
-Please check the legal regulations in your country before using it.
-We don't take any responsibility for what you do with this program.
-
-## DONATIONS
-
-- We don't ask much, if possible feed stray animals in your free time.
