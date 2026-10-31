@@ -10,6 +10,14 @@
 #include <esp_bt_main.h>
 #include <esp_gap_ble_api.h>
 
+// Hardware-independent parsing/serialization, unit-tested on the host.
+// See lib/artemisz_core/ and TESTING.md.
+#include "frame80211.h"
+#include "eapol.h"
+#include "pcap.h"
+#include "hccapx.h"
+#include "hexfmt.h"
+
 // Bypass ESP-IDF Wi-Fi Stack Libraries restriction on sending management frames
 // Without this, deauth/disassoc frames (0xC0, 0xA0) are silently dropped by the firmware
 // Ref: risinek/esp32-wifi-penetration-tool, GANESH-ICMC/esp32-deauther, ESP32Marauder
@@ -350,78 +358,50 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (memcmp(addr3, _selectedNetwork.bssid, 6) != 0) return;
 
   // --- EAPOL handshake capture (data frames) ---
+  // Frame/EAPOL parsing & PMKID extraction live in the tested artemisz_core
+  // library; this block only performs the capture bookkeeping into the global
+  // handshake store.
   if (type == WIFI_PKT_DATA && frameType == 2) {
-    bool isQoS = (frameSubtype >= 8);
-    int hdrLen = isQoS ? 26 : 24;
-    if (len >= (uint16_t)(hdrLen + 12)) {
-      if (payload[hdrLen] == 0xAA && payload[hdrLen+1] == 0xAA &&
-          payload[hdrLen+2] == 0x03 && payload[hdrLen+6] == 0x88 &&
-          payload[hdrLen+7] == 0x8E) {
-        int eapolOff = hdrLen + 8;
-        if (len >= (uint16_t)(eapolOff + 7)) {
-          uint8_t eapolType = payload[eapolOff + 1];
-          if (eapolType == 0x03) { // EAPOL-Key
-            uint16_t keyInfo = ((uint16_t)payload[eapolOff + 5] << 8) | payload[eapolOff + 6];
-            bool hasAck = (keyInfo & 0x0080) != 0;
-            bool hasMIC = (keyInfo & 0x0100) != 0;
-            int msgNum = 0;
-            if (hasAck && !hasMIC) msgNum = 1;
-            else if (!hasAck && hasMIC) {
-              bool nonceZero = true;
-              if (len >= (uint16_t)(eapolOff + 17 + 32)) {
-                for (int n = 0; n < 32; n++) {
-                  if (payload[eapolOff + 17 + n] != 0) { nonceZero = false; break; }
-                }
-              }
-              msgNum = nonceZero ? 4 : 2;
-            }
-            else if (hasAck && hasMIC) msgNum = 3;
-            if (msgNum > 0) {
-              const uint8_t* apMAC = _selectedNetwork.bssid;
-              const uint8_t* clientMAC = (memcmp(addr2, apMAC, 6) == 0) ? addr1 : addr2;
-              int hsIdx = -1;
-              for (int i = 0; i < _handshakeCount; i++) {
-                if (memcmp(_handshakes[i].bssid, apMAC, 6) == 0 &&
-                    memcmp(_handshakes[i].client, clientMAC, 6) == 0) {
-                  hsIdx = i; break;
-                }
-              }
-              if (hsIdx < 0 && _handshakeCount < MAX_HANDSHAKES) {
-                hsIdx = _handshakeCount;
-                memset(&_handshakes[hsIdx], 0, sizeof(_Handshake));
-                memcpy(_handshakes[hsIdx].bssid, apMAC, 6);
-                memcpy(_handshakes[hsIdx].client, clientMAC, 6);
-                _handshakeCount++;
-              }
-              if (hsIdx >= 0) {
-                int idx = msgNum - 1;
-                uint16_t copyLen = (len > MAX_RAW_PKT) ? MAX_RAW_PKT : len;
-                memcpy(_handshakes[hsIdx].pkts[idx].data, payload, copyLen);
-                _handshakes[hsIdx].pkts[idx].len = copyLen;
-                _handshakes[hsIdx].msgMask |= (1 << idx);
-                if (msgNum == 1 && len >= (uint16_t)(eapolOff + 17 + 32)) {
-                  memcpy(_handshakes[hsIdx].anonce, payload + eapolOff + 17, 32);
-                }
-                // PMKID extraction from msg1 Key Data
-                if (msgNum == 1 && len >= (uint16_t)(eapolOff + 99)) {
-                  uint16_t keyDataLen = ((uint16_t)payload[eapolOff + 97] << 8) | payload[eapolOff + 98];
-                  int kdOff = eapolOff + 99;
-                  if (keyDataLen >= 22 && len >= (uint16_t)(kdOff + keyDataLen)) {
-                    for (int k = kdOff; k <= kdOff + (int)keyDataLen - 22; k++) {
-                      if (payload[k] == 0xdd && payload[k+2] == 0x00 &&
-                          payload[k+3] == 0x0f && payload[k+4] == 0xac && payload[k+5] == 0x04) {
-                        if (_pmkidCount < MAX_PMKID) {
-                          memcpy(_pmkids[_pmkidCount].bssid, apMAC, 6);
-                          memcpy(_pmkids[_pmkidCount].client, clientMAC, 6);
-                          memcpy(_pmkids[_pmkidCount].pmkid, payload + k + 6, 16);
-                          _pmkidCount++;
-                        }
-                        break;
-                      }
-                    }
-                  }
-                }
-              }
+    int hdrLen = artemisz::dataHeaderLen(payload[0]);
+    int eapolOff = artemisz::eapolOffsetIn80211(payload, len, hdrLen);
+    if (eapolOff > 0) {
+      const uint8_t* eapol = payload + eapolOff;
+      int eapolAvail = (int)len - eapolOff;
+      int msgNum = artemisz::eapolKeyMessageNumber(eapol, eapolAvail);
+      if (msgNum > 0) {
+        const uint8_t* apMAC = _selectedNetwork.bssid;
+        const uint8_t* clientMAC = (memcmp(addr2, apMAC, 6) == 0) ? addr1 : addr2;
+        int hsIdx = -1;
+        for (int i = 0; i < _handshakeCount; i++) {
+          if (memcmp(_handshakes[i].bssid, apMAC, 6) == 0 &&
+              memcmp(_handshakes[i].client, clientMAC, 6) == 0) {
+            hsIdx = i; break;
+          }
+        }
+        if (hsIdx < 0 && _handshakeCount < MAX_HANDSHAKES) {
+          hsIdx = _handshakeCount;
+          memset(&_handshakes[hsIdx], 0, sizeof(_Handshake));
+          memcpy(_handshakes[hsIdx].bssid, apMAC, 6);
+          memcpy(_handshakes[hsIdx].client, clientMAC, 6);
+          _handshakeCount++;
+        }
+        if (hsIdx >= 0) {
+          int idx = msgNum - 1;
+          uint16_t copyLen = (len > MAX_RAW_PKT) ? MAX_RAW_PKT : len;
+          memcpy(_handshakes[hsIdx].pkts[idx].data, payload, copyLen);
+          _handshakes[hsIdx].pkts[idx].len = copyLen;
+          _handshakes[hsIdx].msgMask |= (1 << idx);
+          if (msgNum == 1) {
+            artemisz::eapolKeyNonce(eapol, eapolAvail, _handshakes[hsIdx].anonce);
+          }
+          // PMKID extraction from msg1 Key Data
+          if (msgNum == 1 && _pmkidCount < MAX_PMKID) {
+            uint8_t pmkid[16];
+            if (artemisz::extractPmkid(eapol, eapolAvail, pmkid)) {
+              memcpy(_pmkids[_pmkidCount].bssid, apMAC, 6);
+              memcpy(_pmkids[_pmkidCount].client, clientMAC, 6);
+              memcpy(_pmkids[_pmkidCount].pmkid, pmkid, 16);
+              _pmkidCount++;
             }
           }
         }
@@ -1353,16 +1333,10 @@ void handleIndex() {
 
 
 String bytesToStr(const uint8_t* b, uint32_t size) {
-  String str;
-  const char ZERO = '0';
-  const char DOUBLEPOINT = ':';
-  for (uint32_t i = 0; i < size; i++) {
-    if (b[i] < 0x10) str += ZERO;
-    str += String(b[i], HEX);
-
-    if (i < size - 1) str += DOUBLEPOINT;
-  }
-  return str;
+  if (size > 20) size = 20;  // guard the stack buffer below (20*3 + 1 <= 64)
+  char buf[64];
+  artemisz::bytesToHex(b, size, buf, /*colon=*/true);
+  return String(buf);
 }
 
 uint8_t broadcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -1431,37 +1405,30 @@ void handlePcapDownload() {
     return;
   }
   WiFiClient client = webServer.client();
-  // PCAP global header
-  uint8_t pcapHdr[24];
-  pcapHdr[0]=0xd4; pcapHdr[1]=0xc3; pcapHdr[2]=0xb2; pcapHdr[3]=0xa1; // magic
-  pcapHdr[4]=0x02; pcapHdr[5]=0x00; pcapHdr[6]=0x04; pcapHdr[7]=0x00; // v2.4
-  memset(pcapHdr+8, 0, 8);                                            // tz, sigfigs
-  pcapHdr[16]=0xFF; pcapHdr[17]=0xFF; pcapHdr[18]=0x00; pcapHdr[19]=0x00; // snaplen 65535
-  pcapHdr[20]=0x69; pcapHdr[21]=0x00; pcapHdr[22]=0x00; pcapHdr[23]=0x00; // link: 802.11
-  int totalSize = 24;
+  // PCAP global header (serialized by the tested artemisz_core library)
+  uint8_t pcapHdr[artemisz::PCAP_GLOBAL_HEADER_LEN];
+  artemisz::pcapGlobalHeader(pcapHdr);
+  int totalSize = artemisz::PCAP_GLOBAL_HEADER_LEN;
   for (int i = 0; i < _handshakeCount; i++)
     for (int m = 0; m < 4; m++)
       if (_handshakes[i].pkts[m].len > 0)
-        totalSize += 16 + _handshakes[i].pkts[m].len;
+        totalSize += artemisz::PCAP_RECORD_HEADER_LEN + _handshakes[i].pkts[m].len;
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: application/octet-stream");
   client.println("Content-Disposition: attachment; filename=handshakes.pcap");
   client.print("Content-Length: "); client.println(totalSize);
   client.println("Connection: close");
   client.println();
-  client.write(pcapHdr, 24);
+  client.write(pcapHdr, artemisz::PCAP_GLOBAL_HEADER_LEN);
   uint32_t tsSec = millis() / 1000;
   for (int i = 0; i < _handshakeCount; i++) {
     for (int m = 0; m < 4; m++) {
       uint16_t pLen = _handshakes[i].pkts[m].len;
       if (pLen == 0) continue;
-      uint8_t pH[16];
+      uint8_t pH[artemisz::PCAP_RECORD_HEADER_LEN];
       uint32_t usec = m * 100000;
-      pH[0]=tsSec&0xFF; pH[1]=(tsSec>>8)&0xFF; pH[2]=(tsSec>>16)&0xFF; pH[3]=(tsSec>>24)&0xFF;
-      pH[4]=usec&0xFF; pH[5]=(usec>>8)&0xFF; pH[6]=(usec>>16)&0xFF; pH[7]=(usec>>24)&0xFF;
-      pH[8]=pLen&0xFF; pH[9]=(pLen>>8)&0xFF; pH[10]=0; pH[11]=0;
-      pH[12]=pLen&0xFF; pH[13]=(pLen>>8)&0xFF; pH[14]=0; pH[15]=0;
-      client.write(pH, 16);
+      artemisz::pcapRecordHeader(pH, tsSec, usec, pLen, pLen);
+      client.write(pH, artemisz::PCAP_RECORD_HEADER_LEN);
       client.write(_handshakes[i].pkts[m].data, pLen);
     }
     tsSec++;
@@ -1747,7 +1714,7 @@ void handleHccapxDownload() {
   }
 
   WiFiClient client = webServer.client();
-  int totalSize = readyCount * 393;
+  int totalSize = readyCount * artemisz::HCCAPX_RECORD_LEN;
 
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: application/octet-stream");
@@ -1759,56 +1726,47 @@ void handleHccapxDownload() {
   for (int i = 0; i < _handshakeCount; i++) {
     if ((_handshakes[i].msgMask & 0x03) != 0x03) continue;
 
-    uint8_t rec[393];
-    memset(rec, 0, 393);
-
-    // Signature "HCPX"
-    rec[0]=0x48; rec[1]=0x43; rec[2]=0x50; rec[3]=0x58;
-    rec[4]=0x04; // Version 4
-    rec[8]=0x00; // Message pair: M1+M2
-
-    // ESSID
-    int essidLen = _selectedNetwork.ssid.length();
-    if (essidLen > 32) essidLen = 32;
-    rec[9] = essidLen;
-    memcpy(rec + 10, _selectedNetwork.ssid.c_str(), essidLen);
-
-    // MAC AP + ANonce
-    memcpy(rec + 59, _handshakes[i].bssid, 6);
-    memcpy(rec + 65, _handshakes[i].anonce, 32);
-    // MAC STA
-    memcpy(rec + 97, _handshakes[i].client, 6);
-
-    // Process msg2 for SNonce, MIC, keyver, EAPOL
+    // Derive SNonce / MIC / keyver / EAPOL from the stored msg2 frame using the
+    // tested artemisz_core parser. Zero fallbacks mirror the previous behaviour
+    // when msg2 is too short to hold the EAPOL-Key fields.
     const uint8_t* m2 = _handshakes[i].pkts[1].data;
     uint16_t m2Len = _handshakes[i].pkts[1].len;
-    bool m2QoS = ((m2[0] >> 4) & 0x0F) >= 8;
-    int m2Hdr = m2QoS ? 26 : 24;
-    int m2Eapol = m2Hdr + 8; // EAPOL version byte offset
+    uint8_t snonce[32]; memset(snonce, 0, sizeof(snonce));
+    uint8_t mic[16];    memset(mic, 0, sizeof(mic));
+    uint8_t keyver = 0;
+    const uint8_t* eapol = m2;  // valid non-null fallback (eapolLen stays 0)
+    int eapolLen = 0;
 
-    if (m2Len > (uint16_t)(m2Eapol + 99)) {
-      // Key version
-      uint16_t keyInfo = ((uint16_t)m2[m2Eapol + 5] << 8) | m2[m2Eapol + 6];
-      rec[42] = keyInfo & 0x07;
-
-      // Key MIC
-      memcpy(rec + 43, m2 + m2Eapol + 81, 16);
-      // SNonce
-      memcpy(rec + 103, m2 + m2Eapol + 17, 32);
-
-      // EAPOL frame with MIC zeroed
-      int eapolLen = m2Len - m2Eapol;
-      if (eapolLen > 256) eapolLen = 256;
-      if (eapolLen > 0) {
-        rec[135] = eapolLen & 0xFF;
-        rec[136] = (eapolLen >> 8) & 0xFF;
-        memcpy(rec + 137, m2 + m2Eapol, eapolLen);
-        // Zero the MIC in the EAPOL copy
-        if (eapolLen > 96) memset(rec + 137 + 81, 0, 16);
+    int m2Hdr = artemisz::dataHeaderLen(m2[0]);
+    int m2Eapol = artemisz::eapolOffsetIn80211(m2, m2Len, m2Hdr);
+    if (m2Eapol >= 0) {
+      const uint8_t* e2 = m2 + m2Eapol;
+      int e2Avail = (int)m2Len - m2Eapol;
+      if (e2Avail > 99) {  // matches the old `m2Len > m2Eapol + 99` guard
+        keyver = artemisz::eapolKeyVersion(e2, e2Avail);
+        artemisz::eapolKeyMic(e2, e2Avail, mic);
+        artemisz::eapolKeyNonce(e2, e2Avail, snonce);
+        eapol = e2;
+        eapolLen = e2Avail;
       }
     }
 
-    client.write(rec, 393);
+    artemisz::HccapxInput in;
+    in.essid = _selectedNetwork.ssid.c_str();
+    in.essidLen = _selectedNetwork.ssid.length();
+    in.macAp = _handshakes[i].bssid;
+    in.macSta = _handshakes[i].client;
+    in.anonce = _handshakes[i].anonce;
+    in.snonce = snonce;
+    in.keyver = keyver;
+    in.mic = mic;
+    in.eapol = eapol;
+    in.eapolLen = eapolLen;
+    in.messagePair = 0;  // M1 + M2
+
+    uint8_t rec[artemisz::HCCAPX_RECORD_LEN];
+    artemisz::buildHccapxRecord(rec, in);
+    client.write(rec, artemisz::HCCAPX_RECORD_LEN);
   }
 }
 
