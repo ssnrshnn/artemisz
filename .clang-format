@@ -1,0 +1,6 @@
+# Style for the artemisz_core library and tests (Google-based, 80 columns).
+# Apply with:  clang-format -i lib/artemisz_core/* test/*
+BasedOnStyle: Google
+ColumnLimit: 80
+DerivePointerAlignment: false
+PointerAlignment: Left

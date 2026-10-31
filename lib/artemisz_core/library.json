@@ -1,0 +1,12 @@
+{
+  "name": "artemisz_core",
+  "version": "0.1.0",
+  "description": "Hardware-independent 802.11 / EAPOL / PMKID parsing and PCAP / HCCAPX serialization for the Artemisz firmware. Pure C++ with no Arduino or ESP-IDF dependencies, so it can be unit-tested on the host.",
+  "keywords": "802.11, eapol, pmkid, pcap, hccapx, parser",
+  "license": "MIT",
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "flags": ["-std=c++11"]
+  }
+}

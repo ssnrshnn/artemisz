@@ -114,6 +114,20 @@ All buttons connect to GND on the other side. Internal pull-ups are used.
 
 > **Note:** This project requires `espressif32@6.7.0` (Arduino Core 2.0.x / ESP-IDF 4.4). Arduino Core 3.x (ESP-IDF 5.x) blocks raw management frame injection. The pinned platform version in `platformio.ini` handles this automatically.
 
+## Development & Tests
+
+The protocol-parsing and export logic (802.11 frame decoding, EAPOL 4-way
+handshake classification, PMKID extraction, PCAP/HCCAPX serialization) lives in
+a hardware-independent library at [`lib/artemisz_core/`](lib/artemisz_core) and
+is covered by host-side unit tests — no ESP32 needed:
+
+```
+make test
+```
+
+See [TESTING.md](TESTING.md) for details. CI builds the firmware and runs the
+test suite on every push.
+
 ## Serial CLI
 
 Connect at 115200 baud and type `help`. Available commands:
